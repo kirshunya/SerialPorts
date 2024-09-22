@@ -18,6 +18,7 @@ var (
 	inputPortName2  string
 	outputPortName2 string
 	baudRate        int
+	parity          string // Переменная для хранения паритета
 )
 
 var (
@@ -29,7 +30,6 @@ var (
 func main() {
 	for {
 		selectPortsAndBaudRate()
-
 		// Открываем COM-порты для отправки и получения данных
 		transmitter1, err := openPort(outputPortName1, baudRate)
 		if err != nil {
@@ -90,14 +90,10 @@ func main() {
 		if err := scanner.Err(); err != nil {
 			log.Fatal(err)
 		}
-
-		// После завершения передачи данных, возвращаемся к выбору портов
-		fmt.Println("Возвращаемся в меню выбора пар COM-портов...")
 	}
 }
 
 func selectPortsAndBaudRate() {
-	// Получаем список доступных пар портов
 	pairs, err := getAvailablePortPairs()
 	if err != nil {
 		log.Fatal(err)
@@ -126,7 +122,6 @@ func selectPortsAndBaudRate() {
 	outputPortName1 = pairs[choice1-1][0]
 	inputPortName1 = pairs[choice1-1][1]
 
-	// Ввод выбора второй пары портов
 	var choice2 int
 	fmt.Print("Выберите номер второй (отправка <-) пары портов (например, 1): ")
 	fmt.Scan(&choice2)
@@ -139,13 +134,27 @@ func selectPortsAndBaudRate() {
 	outputPortName2 = pairs[choice2-1][0]
 	inputPortName2 = pairs[choice2-1][1]
 
-	// Ввод скорости
 	fmt.Print("Введите скорость (baud rate) (например, 9600): ")
 	fmt.Scan(&baudRate)
+
+	// Добавляем выбор паритета
+	fmt.Print("Выберите паритет (None, Even, Odd): ")
+	fmt.Scan(&parity)
 }
 
 func openPort(portName string, baud int) (*serial.Port, error) {
 	c := &serial.Config{Name: portName, Baud: baud}
+
+	// Установка паритета в конфигурации порта
+	switch parity {
+	case "Even":
+		c.Parity = serial.ParityEven
+	case "Odd":
+		c.Parity = serial.ParityOdd
+	default:
+		c.Parity = serial.ParityNone
+	}
+
 	return serial.OpenPort(c)
 }
 
@@ -179,7 +188,6 @@ func printStatus(pairNum int) {
 	mu.Unlock()
 }
 
-// getAvailablePortPairs возвращает список доступных пар COM-портов
 func getAvailablePortPairs() ([][]string, error) {
 	var pairs [][]string
 	var ports []string
@@ -202,13 +210,11 @@ func getAvailablePortPairs() ([][]string, error) {
 		}
 	}
 
-	// Ищем парные порты
 	portMap := make(map[string]bool)
 	for _, port := range ports {
 		portMap[port] = true
 	}
 
-	// Проверяем все порты на наличие пар
 	for _, port := range ports {
 		portNumber := port[3:] // Получаем номер порта
 		num := 0
