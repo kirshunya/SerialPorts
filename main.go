@@ -68,7 +68,7 @@ func main() {
 				if data == "exit" {
 					return
 				}
-				n := 1 // Замените на номер группы
+				n := len(data) // Длина данных, которые мы хотим отправить
 				packet := createPacket(data, n)
 
 				if err := sendData(transmitter1, string(packet)); err != nil {
@@ -101,7 +101,7 @@ func createPacket(data string, n int) []byte {
 
 	// Длина данных
 	dataLength := n                      // Длина поля данных равна n
-	packet := make([]byte, 4+dataLength) // 2 (Flag) + 1 (Destination Address) + 1 (Source Address) + n (Data) + 1 (FCS)
+	packet := make([]byte, 5+dataLength) // 2 (Flag) + 1 (Destination Address) + 1 (Source Address) + n (Data) + 1 (FCS)
 
 	// Заполняем флаг
 	copy(packet[0:2], []byte(flag)) // 2 байта для флага
@@ -109,8 +109,12 @@ func createPacket(data string, n int) []byte {
 	packet[3] = byte(1)             // Source Address (например, номер порта, в данном случае 1)
 
 	// Заполняем данные
-	for i := 0; i < dataLength && i < len(data); i++ {
-		packet[4+i] = data[i]
+	for i := 0; i < dataLength; i++ {
+		if i < len(data) {
+			packet[4+i] = data[i] // Заполняем данными
+		} else {
+			packet[4+i] = 0 // Заполняем нулями, если данных меньше, чем n
+		}
 	}
 
 	// Добавляем FCS (например, контрольная сумма, здесь просто 0)
@@ -169,13 +173,17 @@ func processReceivedData(data []byte) []byte {
 
 	// Извлекаем данные
 	packetData := data[4 : 4+dataLength]
+	if dataLength < 0 || 4+dataLength > len(data) {
+		return nil
+	}
 
 	// Проверяем FCS (здесь просто пример, не реализована реальная проверка)
 	fcs := data[len(data)-1] // Последний байт - FCS
 
-	// Выводим информацию
-	fmt.Printf("Флаг: %s, Destination Address: %d, Source Address: %d, FCS: %d\n",
-		flag, dstAddr, srcAddr, fcs)
+	// Выводим информацию о пакете
+	fmt.Printf("Полученный пакет (без байт-стаффинга): %v\n", data)
+	fmt.Printf("Флаг: %s, Destination Address: %d, Source Address: %d, FCS: %d, Data: %s\n",
+		flag, dstAddr, srcAddr, fcs, packetData)
 
 	return packetData
 }
