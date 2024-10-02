@@ -3,13 +3,11 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"github.com/tarm/serial"
+	"golang.org/x/sys/windows"
 	"log"
 	"os"
 	"sync"
-	"time"
-
-	"github.com/tarm/serial"
-	"golang.org/x/sys/windows"
 )
 
 var (
@@ -18,7 +16,7 @@ var (
 	inputPortName2  string
 	outputPortName2 string
 	baudRate        int
-	parity          string // Переменная для хранения паритета
+	parity          string
 )
 
 var (
@@ -30,6 +28,7 @@ var (
 func main() {
 	for {
 		selectPortsAndBaudRate()
+
 		// Открываем COM-порты для отправки и получения данных
 		transmitter1, err := openPort(outputPortName1, baudRate)
 		if err != nil {
@@ -43,13 +42,13 @@ func main() {
 		}
 		defer receiver1.Close()
 
-		transmitter2, err := openPort(inputPortName2, baudRate)
+		transmitter2, err := openPort(outputPortName2, baudRate)
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer transmitter2.Close()
 
-		receiver2, err := openPort(outputPortName2, baudRate)
+		receiver2, err := openPort(inputPortName2, baudRate)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -67,21 +66,24 @@ func main() {
 			if scanner.Scan() {
 				data := scanner.Text()
 				if data == "exit" {
-					return // Выход из режима передачи
+					return
 				}
-				if err := sendData(transmitter1, data); err != nil {
+				n := 1 // Замените на номер группы
+				packet := createPacket(data, n)
+
+				if err := sendData(transmitter1, string(packet)); err != nil {
 					log.Println("Ошибка отправки на первую пару:", err)
 				}
 				mu.Lock()
-				totalBytesSent1 += len(data)
+				totalBytesSent1 += len(packet)
 				mu.Unlock()
 				printStatus(1)
 
-				if err := sendData(transmitter2, data); err != nil {
+				if err := sendData(transmitter2, string(packet)); err != nil {
 					log.Println("Ошибка отправки на вторую пару:", err)
 				}
 				mu.Lock()
-				totalBytesSent2 += len(data)
+				totalBytesSent2 += len(packet)
 				mu.Unlock()
 				printStatus(2)
 			}
@@ -91,6 +93,109 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+}
+
+func createPacket(data string, n int) []byte {
+	// Формируем флаг
+	flag := fmt.Sprintf("$%c", 'a'+rune(n))
+
+	// Длина данных
+	dataLength := n                      // Длина поля данных равна n
+	packet := make([]byte, 4+dataLength) // 2 (Flag) + 1 (Destination Address) + 1 (Source Address) + n (Data) + 1 (FCS)
+
+	// Заполняем флаг
+	copy(packet[0:2], []byte(flag)) // 2 байта для флага
+	packet[2] = 0                   // Destination Address (нулевой)
+	packet[3] = byte(1)             // Source Address (например, номер порта, в данном случае 1)
+
+	// Заполняем данные
+	for i := 0; i < dataLength && i < len(data); i++ {
+		packet[4+i] = data[i]
+	}
+
+	// Добавляем FCS (например, контрольная сумма, здесь просто 0)
+	packet[4+dataLength] = 0 // FCS
+
+	// Реализуем байт-стаффинг
+	packet = byteStuffing(packet)
+
+	return packet
+}
+
+func byteStuffing(data []byte) []byte {
+	var stuffed []byte
+	for _, b := range data {
+		if b == '$' { // пример специального символа
+			stuffed = append(stuffed, '$', '$') // дублируем символ
+		} else {
+			stuffed = append(stuffed, b)
+		}
+	}
+	return stuffed
+}
+
+func receiveData(port *serial.Port, id int) {
+	buf := make([]byte, 128) // Буфер для получаемых данных
+	for {
+		n, err := port.Read(buf)
+		if err != nil {
+			log.Println("Ошибка чтения:", err)
+			continue
+		}
+
+		if n > 0 {
+			data := buf[:n]
+			processedData := processReceivedData(data)
+			if processedData != nil {
+				fmt.Printf("Приемник %d получил данные: %s\n", id, processedData)
+			}
+		}
+	}
+}
+
+func processReceivedData(data []byte) []byte {
+	// Удаляем байт-стаффинг
+	data = byteDestuffing(data)
+
+	// Проверка длины пакета и извлечение данных
+	if len(data) < 5 { // Минимальная длина должна быть 5 байт
+		return nil
+	}
+
+	flag := string(data[0:2])   // Первые 2 байта - флаг
+	dstAddr := data[2]          // 3-й байт - Destination Address
+	srcAddr := data[3]          // 4-й байт - Source Address
+	dataLength := len(data) - 5 // Длина данных
+
+	// Извлекаем данные
+	packetData := data[4 : 4+dataLength]
+
+	// Проверяем FCS (здесь просто пример, не реализована реальная проверка)
+	fcs := data[len(data)-1] // Последний байт - FCS
+
+	// Выводим информацию
+	fmt.Printf("Флаг: %s, Destination Address: %d, Source Address: %d, FCS: %d\n",
+		flag, dstAddr, srcAddr, fcs)
+
+	return packetData
+}
+
+func byteDestuffing(data []byte) []byte {
+	var destuffed []byte
+	for i := 0; i < len(data); i++ {
+		if data[i] == '$' && i+1 < len(data) && data[i+1] == '$' {
+			destuffed = append(destuffed, '$') // Удаляем дублированный символ
+			i++                                // Пропускаем следующий символ
+		} else {
+			destuffed = append(destuffed, data[i])
+		}
+	}
+	return destuffed
+}
+
+func sendData(port *serial.Port, data string) error {
+	_, err := port.Write([]byte(data)) // Преобразуем строку обратно в байты
+	return err
 }
 
 func selectPortsAndBaudRate() {
@@ -158,25 +263,20 @@ func openPort(portName string, baud int) (*serial.Port, error) {
 	return serial.OpenPort(c)
 }
 
-func sendData(port *serial.Port, data string) error {
-	_, err := port.Write([]byte(data))
-	return err
-}
-
-func receiveData(port *serial.Port, pairNum int) {
-	buf := make([]byte, 128)
-	for {
-		n, err := port.Read(buf)
-		if err != nil {
-			log.Printf("Ошибка чтения с порта %d: %v\n", pairNum, err)
-			continue
-		}
-		if n > 0 {
-			fmt.Printf("Получено на порту %d: %s\n", pairNum, string(buf[:n]))
-		}
-		time.Sleep(100 * time.Millisecond) // Задержка для предотвращения перегрузки
-	}
-}
+//func receiveData(port *serial.Port, pairNum int) {
+//	buf := make([]byte, 128)
+//	for {
+//		n, err := port.Read(buf)
+//		if err != nil {
+//			log.Printf("Ошибка чтения с порта %d: %v\n", pairNum, err)
+//			continue
+//		}
+//		if n > 0 {
+//			fmt.Printf("Получено на порту %d: %s\n", pairNum, string(buf[:n]))
+//		}
+//		time.Sleep(100 * time.Millisecond) // Задержка для предотвращения перегрузки
+//	}
+//}
 
 func printStatus(pairNum int) {
 	mu.Lock()
