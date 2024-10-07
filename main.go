@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"golang.org/x/sys/windows"
 	"log"
+	"math/rand"
 	"os"
 	"sync"
 	"time"
@@ -13,12 +14,15 @@ import (
 )
 
 const (
-	n          = 1
-	flagPrefix = '$'
-	flagSuffix = 'a' + n
-	dataLength = n + 1
-	escapeChar = 0x2A
-	escapeXOR  = 0x20
+	n                   = 1
+	flagPrefix          = '$'
+	flagSuffix          = 'a' + 1
+	dataLength          = n + 1
+	escapeChar          = 0x2A
+	escapeXOR           = 0x20
+	fcsLengthInBits     = 8 // Длина FCS в битах для одиночных ошибок
+	fcsLengthInBytes    = (fcsLengthInBits + 7) / 8
+	cyclicRedundancyGen = 0x07 // Полином CRC-8
 )
 
 type Frame struct {
@@ -26,7 +30,7 @@ type Frame struct {
 	SourceAddress      byte
 	DestinationAddress byte
 	Data               [dataLength]byte
-	FCS                byte
+	FCS                [fcsLengthInBytes]byte
 }
 
 var (
@@ -42,6 +46,8 @@ var (
 )
 
 func main() {
+	rand.Seed(time.Now().UnixNano())
+
 	for {
 		selectPortsAndBaudRate()
 		transmitter1, err := openPort(outputPortName1, baudRate)
@@ -56,13 +62,13 @@ func main() {
 		}
 		defer receiver1.Close()
 
-		transmitter2, err := openPort(inputPortName2, baudRate)
+		transmitter2, err := openPort(outputPortName2, baudRate)
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer transmitter2.Close()
 
-		receiver2, err := openPort(outputPortName2, baudRate)
+		receiver2, err := openPort(inputPortName2, baudRate)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -127,7 +133,7 @@ func createFrame(data []byte, sourceAddress byte) Frame {
 		Flag:               [2]byte{flagPrefix, flagSuffix},
 		SourceAddress:      sourceAddress,
 		DestinationAddress: 0,
-		FCS:                0,
+		FCS:                [fcsLengthInBytes]byte{},
 	}
 
 	copy(frame.Data[:], data)
@@ -137,7 +143,23 @@ func createFrame(data []byte, sourceAddress byte) Frame {
 		}
 	}
 
+	frame.FCS = calculateFCS(frame.Data[:]) // Вычисление FCS
 	return frame
+}
+
+func calculateFCS(data []byte) [fcsLengthInBytes]byte {
+	var fcs [fcsLengthInBytes]byte
+	for _, b := range data {
+		for i := 0; i < 8; i++ {
+			bit := (b >> (7 - i)) & 0x01
+			if (fcs[0]>>7)&0x01 != bit {
+				fcs[0] = (fcs[0] << 1) ^ cyclicRedundancyGen
+			} else {
+				fcs[0] <<= 1
+			}
+		}
+	}
+	return fcs
 }
 
 func deByteStuffing(frame []byte) []byte {
@@ -155,17 +177,17 @@ func deByteStuffing(frame []byte) []byte {
 
 func printFrameContent(frame []byte) {
 	fmt.Printf("F:'%c%c' ", frame[0], frame[1])
-	fmt.Printf("SA:'%c' ", frame[2])
+	fmt.Printf("SA:'%d' ", frame[2])
 	fmt.Printf("DA:'%c' ", frame[3])
 	fmt.Print("Data:'")
-	for i := 4; i < len(frame)-1; i++ {
+	for i := 4; i < len(frame)-fcsLengthInBytes; i++ {
 		if frame[i] >= 32 && frame[i] <= 126 {
 			fmt.Printf("%c", frame[i])
 		} else {
 			fmt.Printf("\\x%02X", frame[i])
 		}
 	}
-	fmt.Printf("' FCS:'%c'\n", frame[len(frame)-1])
+	fmt.Printf("' FCS:'%x'\n", frame[len(frame)-fcsLengthInBytes]) // Изменено на fcsLengthInBytes
 }
 
 func printReceivedFrame(frame []byte, pairNum int) {
@@ -174,7 +196,33 @@ func printReceivedFrame(frame []byte, pairNum int) {
 
 	deStuffedFrame := deByteStuffing(frame)
 	fmt.Printf("Порт %d | Кадр после де-байт-стаффинга: ", pairNum)
-	printFrameContent(deStuffedFrame)
+
+	if len(deStuffedFrame) < 5+fcsLengthInBytes {
+		log.Println("Ошибка: недостаточно данных в кадре после де-байт-стаффинга")
+		return
+	}
+
+	// Подсветка поля FCS
+	computedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
+	fmt.Print("Data:'")
+	for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
+		if deStuffedFrame[i] >= 32 && deStuffedFrame[i] <= 126 {
+			fmt.Printf("%c", deStuffedFrame[i])
+		} else {
+			fmt.Printf("\\x%02X", deStuffedFrame[i])
+		}
+	}
+	fmt.Printf("' FCS:'\033[4m%x\033[0m'\n", computedFCS[0]) // Взять только первый элемент для FCS
+
+	// Вставляем случайное искажение одного бита в поле Data
+	if rand.Float32() < 0.7 { // Вероятность искажения 70%
+		dataIndex := rand.Intn(dataLength)
+		if dataIndex < len(deStuffedFrame)-fcsLengthInBytes {
+			// Искажение одного бита
+			deStuffedFrame[dataIndex+4] ^= 1 << uint(rand.Intn(8))
+			fmt.Printf("Случайное искажение бита в Data: %d\n", dataIndex+4)
+		}
+	}
 }
 
 func byteStuffing(frame Frame) []byte {
@@ -186,7 +234,9 @@ func byteStuffing(frame Frame) []byte {
 	for _, b := range frame.Data {
 		result = appendWithStuffing(result, b)
 	}
-	result = appendWithStuffing(result, frame.FCS)
+	for _, b := range frame.FCS {
+		result = appendWithStuffing(result, b)
+	}
 
 	return result
 }
@@ -212,7 +262,7 @@ func receiveData(port *serial.Port, pairNum int) {
 					inFrame = true
 				} else if inFrame {
 					frame = append(frame, b)
-					if len(frame) >= 5+dataLength {
+					if len(frame) >= 5+dataLength+fcsLengthInBytes {
 						printReceivedFrame(frame, pairNum)
 						inFrame = false
 					}
