@@ -16,7 +16,7 @@ import (
 const (
 	flagPrefix          = '$'
 	flagSuffix          = 'a' + 1
-	dataLength          = 2 // Увеличьте, если нужно больше данных
+	dataLength          = 2
 	escapeChar          = 0x2A
 	escapeXOR           = 0x20
 	fcsLengthInBits     = 8
@@ -42,72 +42,58 @@ var (
 	totalBytesSent1 int
 	totalBytesSent2 int
 	mu              sync.Mutex
+
+	// Глобальные переменные для передатчиков
+	transmitter1 *serial.Port
+	transmitter2 *serial.Port
 )
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
 
+	selectPortsAndBaudRate()
+	var err error
+	transmitter1, err = openPort(outputPortName1, baudRate)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer transmitter1.Close()
+
+	receiver1, err := openPort(inputPortName1, baudRate)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer receiver1.Close()
+
+	transmitter2, err = openPort(outputPortName2, baudRate)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer transmitter2.Close()
+
+	receiver2, err := openPort(inputPortName2, baudRate)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer receiver2.Close()
+
+	go receiveData(receiver1, 1)
+	go receiveData(receiver2, 2)
+
+	scanner := bufio.NewScanner(os.Stdin)
+	fmt.Println("Введите символы для отправки (нajmiete Enter для отправки), 'exit' для выхода:")
+
 	for {
-		selectPortsAndBaudRate()
-		transmitter1, err := openPort(outputPortName1, baudRate)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer transmitter1.Close()
+		if scanner.Scan() {
+			data := scanner.Text()
+			if data == "exit" {
+				return
+			}
 
-		receiver1, err := openPort(inputPortName1, baudRate)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer receiver1.Close()
-
-		transmitter2, err := openPort(outputPortName2, baudRate)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer transmitter2.Close()
-
-		receiver2, err := openPort(inputPortName2, baudRate)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer receiver2.Close()
-
-		go receiveData(receiver1, 1)
-		go receiveData(receiver2, 2)
-
-		scanner := bufio.NewScanner(os.Stdin)
-		fmt.Println("Введите символы для отправки (нажмите Enter для отправки), 'exit' для выхода:")
-
-		for {
-			if scanner.Scan() {
-				data := scanner.Text()
-				if data == "exit" {
-					return
-				}
-
-				// Отправляем данные на оба порта
-				for _, port := range []struct {
-					transmitter *serial.Port
-					portNum     int
-				}{
-					{transmitter1, 1},
-					{transmitter2, 2},
-				} {
-					frame := createFrame([]byte(data), getPortNumber(outputPortName1))
-					encodedFrame := byteStuffing(frame)
-					if err := sendData(port.transmitter, encodedFrame); err != nil {
-						log.Printf("Ошибка отправки на порт %d: %v", port.portNum, err)
-					}
-					mu.Lock()
-					if port.portNum == 1 {
-						totalBytesSent1 += len(encodedFrame)
-					} else {
-						totalBytesSent2 += len(encodedFrame)
-					}
-					mu.Unlock()
-					printStatus(port.portNum)
-				}
+			if data != "" {
+				sendDataToPorts(data)
+			} else {
+				fmt.Println("Пожалуйста, введите непустую строку.")
 			}
 		}
 
@@ -115,6 +101,115 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+}
+
+func sendDataToPorts(data string) {
+	for _, port := range []struct {
+		transmitter *serial.Port
+		portNum     int
+	}{
+		{transmitter1, 1},
+		{transmitter2, 2},
+	} {
+		// Создаем новый кадр для текущих данных
+		frame := createFrame([]byte(data), getPortNumber(outputPortName1))
+		encodedFrame := byteStuffing(frame)
+
+		if err := sendData(port.transmitter, encodedFrame); err != nil {
+			log.Printf("Ошибка отправки на порт %d: %v", port.portNum, err)
+		}
+
+		mu.Lock()
+		if port.portNum == 1 {
+			totalBytesSent1 += len(encodedFrame)
+		} else {
+			totalBytesSent2 += len(encodedFrame)
+		}
+		mu.Unlock()
+
+		// Обработка искажения данных
+		processReceivedData(encodedFrame, port.portNum)
+	}
+}
+
+func processReceivedData(frame []byte, portNum int) {
+	fmt.Printf("Порт %d | Кадр до де-байт-стаффинга:\n", portNum)
+	printFrameContent(frame)
+
+	deStuffedFrame := deByteStuffing(frame)
+	fmt.Printf("Порт %d | Кадр после де-байт-стаффинга:\n", portNum)
+
+	if len(deStuffedFrame) < 5+fcsLengthInBytes {
+		log.Println("Ошибка: недостаточно данных в кадре после де-байт-стаффинга")
+		return
+	}
+
+	computedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
+	fmt.Print("Data:'")
+	for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
+		if deStuffedFrame[i] >= 32 && deStuffedFrame[i] <= 126 {
+			fmt.Printf("\033[31m%c\033[0m", deStuffedFrame[i])
+		} else {
+			fmt.Printf("%c", deStuffedFrame[i])
+		}
+	}
+	fmt.Printf("' FCS:'%x'\n", computedFCS[0])
+
+	// Случайное искажение только для отправленного кадра
+	if rand.Float32() < 0.7 {
+		dataIndex := rand.Intn(dataLength)
+		if dataIndex < dataLength {
+			deStuffedFrame[4+dataIndex] ^= 1 << uint(rand.Intn(8))
+
+			newComputedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
+
+			if newComputedFCS[0] != computedFCS[0] {
+				fmt.Println("Данные были искажены.")
+				fmt.Printf("Новый вычисленный FCS: %x\n", newComputedFCS[0])
+
+				// Обновляем FCS в кадре
+				deStuffedFrame[len(deStuffedFrame)-fcsLengthInBytes] = newComputedFCS[0]
+
+				// Выводим обновленный кадр
+				fmt.Printf("Обновленный кадр (Порт %d):\n", portNum)
+				printFrameContent(deStuffedFrame)
+				fmt.Printf("\n")
+			} else {
+				fmt.Println("Данные остались прежними.")
+			}
+		}
+	}
+}
+
+func printFrameContent(frame []byte) {
+	fmt.Printf("F:'%c%c' ", frame[0], frame[1])
+	fmt.Printf("SA:'%d' ", frame[2])
+	fmt.Printf("DA:'%c' ", frame[3])
+	fmt.Print("Data:'")
+	for i := 4; i < len(frame)-fcsLengthInBytes; i++ {
+		if frame[i] >= 32 && frame[i] <= 126 {
+			fmt.Printf("\033[31m%c\033[0m", frame[i])
+		} else {
+			fmt.Printf("%c", frame[i])
+		}
+	}
+	fmt.Printf("' FCS:'%x'\n", frame[len(frame)-fcsLengthInBytes])
+}
+
+// Функция для вычисления FCS
+func calculatedFCS(data []byte) [fcsLengthInBytes]byte {
+	var fcs [fcsLengthInBytes]byte
+	for _, b := range data {
+		for i := 0; i < 8; i++ {
+			bit := (b >> (7 - i)) & 0x01
+			if (fcs[0]>>7)&0x01 != bit {
+				fcs[0] = (fcs[0] << 1) ^ cyclicRedundancyGen
+			} else {
+				fcs[0] <<= 1
+			}
+		}
+	}
+	return fcs
 }
 
 func createFrame(data []byte, sourceAddress byte) Frame {
@@ -125,18 +220,16 @@ func createFrame(data []byte, sourceAddress byte) Frame {
 		FCS:                [fcsLengthInBytes]byte{},
 	}
 
-	// Убедитесь, что данные не превышают максимальную длину
 	if len(data) > dataLength {
 		data = data[:dataLength]
 	} else if len(data) < dataLength {
-		// Заполняем оставшиеся байты нулями
 		paddedData := make([]byte, dataLength)
 		copy(paddedData, data)
 		data = paddedData
 	}
 
 	copy(frame.Data[:], data)
-	frame.FCS = calculateFCS(frame.Data[:]) // Вычисление FCS
+	frame.FCS = calculateFCS(frame.Data[:])
 	return frame
 }
 
@@ -157,7 +250,6 @@ func calculateFCS(data []byte) [fcsLengthInBytes]byte {
 
 func byteStuffing(frame Frame) []byte {
 	var result []byte
-
 	result = append(result, frame.Flag[:]...)
 	result = appendWithStuffing(result, frame.SourceAddress)
 	result = appendWithStuffing(result, frame.DestinationAddress)
@@ -167,7 +259,6 @@ func byteStuffing(frame Frame) []byte {
 	for _, b := range frame.FCS {
 		result = appendWithStuffing(result, b)
 	}
-
 	return result
 }
 
@@ -199,14 +290,14 @@ func receiveData(port *serial.Port, pairNum int) {
 			for _, b := range buf[:n] {
 				if b == flagPrefix {
 					if inFrame {
-						printReceivedFrame(frame, pairNum)
+						//printReceivedFrame(frame, pairNum)
 					}
 					frame = []byte{b}
 					inFrame = true
 				} else if inFrame {
 					frame = append(frame, b)
 					if len(frame) >= 5+dataLength+fcsLengthInBytes {
-						printReceivedFrame(frame, pairNum)
+						//printReceivedFrame(frame, pairNum)
 						inFrame = false
 					}
 				}
@@ -217,18 +308,17 @@ func receiveData(port *serial.Port, pairNum int) {
 }
 
 func printReceivedFrame(frame []byte, pairNum int) {
-	fmt.Printf("Порт %d | Кадр до де-байт-стаффинга: ", pairNum)
+	fmt.Printf("\nПорт %d | Кадр до де-байт-стаффинга: ", pairNum)
 	printFrameContent(frame)
 
 	deStuffedFrame := deByteStuffing(frame)
-	fmt.Printf("Порт %d | Кадр после де-байт-стаффинга: ", pairNum)
+	fmt.Printf("\nПорт %d | Кадр после де-байт-стаффинга: ", pairNum)
 
 	if len(deStuffedFrame) < 5+fcsLengthInBytes {
 		log.Println("Ошибка: недостаточно данных в кадре после де-байт-стаффинга")
 		return
 	}
 
-	// Подсчет и вывод FCS
 	computedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
 	fmt.Print("Data:'")
 	for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
@@ -240,19 +330,17 @@ func printReceivedFrame(frame []byte, pairNum int) {
 	}
 	fmt.Printf("' FCS:'%x'\n", computedFCS[0])
 
-	// Случайное искажение одного бита в поле Data
-	if rand.Float32() < 0.7 { // Вероятность искажения 70%
+	// Случайное искажение только для отправленного кадра
+	if rand.Float32() < 0.7 {
 		dataIndex := rand.Intn(dataLength)
 		if dataIndex < dataLength {
-			// Искажение одного бита
+			// Искажение на основе оригинального кадра
 			deStuffedFrame[4+dataIndex] ^= 1 << uint(rand.Intn(8))
 			fmt.Printf("Случайное искажение бита в Data (Порт %d): %d\n", pairNum, 4+dataIndex)
-
-			// Вывод оригинальных и измененных данных в одном месте
-			fmt.Printf("Кадр после искажения (Порт %d): Data:'", pairNum)
+			//fmt.Printf("Кадр после искажения (Порт %d): Data:'", pairNum)
 			for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
 				if deStuffedFrame[i] >= 32 && deStuffedFrame[i] <= 126 {
-					fmt.Printf("\033[31m%c\033[0m", deStuffedFrame[i]) // Красный цвет для измененного бита
+					fmt.Printf("\033[31m%c\033[0m", deStuffedFrame[i])
 				} else {
 					fmt.Printf("%c", deStuffedFrame[i])
 				}
@@ -261,7 +349,6 @@ func printReceivedFrame(frame []byte, pairNum int) {
 		}
 	}
 
-	// Пересчет FCS после искажения
 	newComputedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
 	if newComputedFCS[0] != computedFCS[0] {
 		fmt.Println("Данные были искажены.")
@@ -283,29 +370,9 @@ func deByteStuffing(frame []byte) []byte {
 	return result
 }
 
-func printFrameContent(frame []byte) {
-	fmt.Printf("F:'%c%c' ", frame[0], frame[1])
-	fmt.Printf("SA:'%d' ", frame[2])
-	fmt.Printf("DA:'%c' ", frame[3])
-	fmt.Print("Data:'")
-	for i := 4; i < len(frame)-fcsLengthInBytes; i++ {
-		if frame[i] >= 32 && frame[i] <= 126 {
-			fmt.Printf("%c", frame[i])
-		} else {
-			fmt.Printf("\\x%02X", frame[i])
-		}
-	}
-	fmt.Printf("' FCS:'%x'\n", frame[len(frame)-fcsLengthInBytes])
-}
-
 func printStatus(pairNum int) {
 	mu.Lock()
 	defer mu.Unlock()
-	//if pairNum == 1 {
-	//	fmt.Printf("Скорость порта 1: %d, Количество переданных байт: %d\n", baudRate, totalBytesSent1)
-	//} else {
-	//	fmt.Printf("Скорость порта 2: %d, Количество переданных байт: %d\n", baudRate, totalBytesSent2)
-	//}
 }
 
 func getPortNumber(portName string) byte {
@@ -371,7 +438,6 @@ func openPort(portName string, baud int) (*serial.Port, error) {
 	default:
 		c.Parity = serial.ParityNone
 	}
-
 	return serial.OpenPort(c)
 }
 
