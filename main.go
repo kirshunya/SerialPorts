@@ -42,16 +42,14 @@ var (
 	totalBytesSent1 int
 	totalBytesSent2 int
 	mu              sync.Mutex
-
-	// Глобальные переменные для передатчиков
-	transmitter1 *serial.Port
-	transmitter2 *serial.Port
+	transmitter1    *serial.Port
+	transmitter2    *serial.Port
 )
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-
 	selectPortsAndBaudRate()
+
 	var err error
 	transmitter1, err = openPort(outputPortName1, baudRate)
 	if err != nil {
@@ -81,7 +79,7 @@ func main() {
 	go receiveData(receiver2, 2)
 
 	scanner := bufio.NewScanner(os.Stdin)
-	fmt.Println("Введите символы для отправки (нajmiete Enter для отправки), 'exit' для выхода:")
+	fmt.Println("Введите символы для отправки (нажмите Enter для отправки), 'exit' для выхода:")
 
 	for {
 		if scanner.Scan() {
@@ -111,7 +109,6 @@ func sendDataToPorts(data string) {
 		{transmitter1, 1},
 		{transmitter2, 2},
 	} {
-		// Создаем новый кадр для текущих данных
 		frame := createFrame([]byte(data), getPortNumber(outputPortName1))
 		encodedFrame := byteStuffing(frame)
 
@@ -127,7 +124,6 @@ func sendDataToPorts(data string) {
 		}
 		mu.Unlock()
 
-		// Обработка искажения данных
 		processReceivedData(encodedFrame, port.portNum)
 	}
 }
@@ -144,7 +140,9 @@ func processReceivedData(frame []byte, portNum int) {
 		return
 	}
 
-	computedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
+	originalData := deStuffedFrame[4 : 4+dataLength]
+	computedFCS := calculatedFCS(originalData)
+
 	fmt.Print("Data:'")
 	for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
 		if deStuffedFrame[i] >= 32 && deStuffedFrame[i] <= 126 {
@@ -155,29 +153,30 @@ func processReceivedData(frame []byte, portNum int) {
 	}
 	fmt.Printf("' FCS:'%x'\n", computedFCS[0])
 
-	// Случайное искажение только для отправленного кадра
+	// Случайное искажение
 	if rand.Float32() < 0.7 {
 		dataIndex := rand.Intn(dataLength)
 		if dataIndex < dataLength {
+			originalValue := deStuffedFrame[4+dataIndex]
 			deStuffedFrame[4+dataIndex] ^= 1 << uint(rand.Intn(8))
 
-			newComputedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
+			// Обновляем FCS в кадре
+			deStuffedFrame[len(deStuffedFrame)-fcsLengthInBytes] = calculatedFCS(deStuffedFrame[4 : 4+dataLength])[0]
 
-			if newComputedFCS[0] != computedFCS[0] {
-				fmt.Println("Данные были искажены.")
-				fmt.Printf("Новый вычисленный FCS: %x\n", newComputedFCS[0])
-
-				// Обновляем FCS в кадре
-				deStuffedFrame[len(deStuffedFrame)-fcsLengthInBytes] = newComputedFCS[0]
-
-				// Выводим обновленный кадр
-				fmt.Printf("Обновленный кадр (Порт %d):\n", portNum)
-				printFrameContent(deStuffedFrame)
-				fmt.Printf("\n")
-			} else {
-				fmt.Println("Данные остались прежними.")
-			}
+			fmt.Printf("Случайное искажение бита в Data (Порт %d): %d (было: %02x, стало: %02x)\n", portNum, 4+dataIndex, originalValue, deStuffedFrame[4+dataIndex])
 		}
+	}
+
+	// Проверяем новый FCS
+	newComputedFCS := calculatedFCS(deStuffedFrame[4 : 4+dataLength])
+	if newComputedFCS[0] != computedFCS[0] {
+		fmt.Println("Данные были искажены.")
+		fmt.Printf("Искаженные данные (Порт %d):\n", portNum)
+		printFrameContent(deStuffedFrame) // Выводим искаженные данные
+		fmt.Printf("Оригинальные данные (Порт %d):\n", portNum)
+		printFrameContent(frame) // Показываем оригинальные данные
+	} else {
+		fmt.Println("Данные остались прежними.")
 	}
 }
 
@@ -188,15 +187,14 @@ func printFrameContent(frame []byte) {
 	fmt.Print("Data:'")
 	for i := 4; i < len(frame)-fcsLengthInBytes; i++ {
 		if frame[i] >= 32 && frame[i] <= 126 {
-			fmt.Printf("\033[31m%c\033[0m", frame[i])
+			fmt.Printf("\033[31m%c\033[0m", frame[i]) // Подсветка данных
 		} else {
 			fmt.Printf("%c", frame[i])
 		}
 	}
-	fmt.Printf("' FCS:'%x'\n", frame[len(frame)-fcsLengthInBytes])
+	fmt.Printf("' FCS:'\033[31m%x\033[0m'\n", frame[len(frame)-fcsLengthInBytes]) // Подсветка FCS
 }
 
-// Функция для вычисления FCS
 func calculatedFCS(data []byte) [fcsLengthInBytes]byte {
 	var fcs [fcsLengthInBytes]byte
 	for _, b := range data {
@@ -205,6 +203,7 @@ func calculatedFCS(data []byte) [fcsLengthInBytes]byte {
 			if (fcs[0]>>7)&0x01 != bit {
 				fcs[0] = (fcs[0] << 1) ^ cyclicRedundancyGen
 			} else {
+
 				fcs[0] <<= 1
 			}
 		}
@@ -229,23 +228,8 @@ func createFrame(data []byte, sourceAddress byte) Frame {
 	}
 
 	copy(frame.Data[:], data)
-	frame.FCS = calculateFCS(frame.Data[:])
+	frame.FCS = calculatedFCS(frame.Data[:])
 	return frame
-}
-
-func calculateFCS(data []byte) [fcsLengthInBytes]byte {
-	var fcs [fcsLengthInBytes]byte
-	for _, b := range data {
-		for i := 0; i < 8; i++ {
-			bit := (b >> (7 - i)) & 0x01
-			if (fcs[0]>>7)&0x01 != bit {
-				fcs[0] = (fcs[0] << 1) ^ cyclicRedundancyGen
-			} else {
-				fcs[0] <<= 1
-			}
-		}
-	}
-	return fcs
 }
 
 func byteStuffing(frame Frame) []byte {
@@ -307,56 +291,6 @@ func receiveData(port *serial.Port, pairNum int) {
 	}
 }
 
-func printReceivedFrame(frame []byte, pairNum int) {
-	fmt.Printf("\nПорт %d | Кадр до де-байт-стаффинга: ", pairNum)
-	printFrameContent(frame)
-
-	deStuffedFrame := deByteStuffing(frame)
-	fmt.Printf("\nПорт %d | Кадр после де-байт-стаффинга: ", pairNum)
-
-	if len(deStuffedFrame) < 5+fcsLengthInBytes {
-		log.Println("Ошибка: недостаточно данных в кадре после де-байт-стаффинга")
-		return
-	}
-
-	computedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
-	fmt.Print("Data:'")
-	for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
-		if deStuffedFrame[i] >= 32 && deStuffedFrame[i] <= 126 {
-			fmt.Printf("%c", deStuffedFrame[i])
-		} else {
-			fmt.Printf("\\x%02X", deStuffedFrame[i])
-		}
-	}
-	fmt.Printf("' FCS:'%x'\n", computedFCS[0])
-
-	// Случайное искажение только для отправленного кадра
-	if rand.Float32() < 0.7 {
-		dataIndex := rand.Intn(dataLength)
-		if dataIndex < dataLength {
-			// Искажение на основе оригинального кадра
-			deStuffedFrame[4+dataIndex] ^= 1 << uint(rand.Intn(8))
-			fmt.Printf("Случайное искажение бита в Data (Порт %d): %d\n", pairNum, 4+dataIndex)
-			//fmt.Printf("Кадр после искажения (Порт %d): Data:'", pairNum)
-			for i := 4; i < len(deStuffedFrame)-fcsLengthInBytes; i++ {
-				if deStuffedFrame[i] >= 32 && deStuffedFrame[i] <= 126 {
-					fmt.Printf("\033[31m%c\033[0m", deStuffedFrame[i])
-				} else {
-					fmt.Printf("%c", deStuffedFrame[i])
-				}
-			}
-			fmt.Printf("' FCS:'\033[4m%x\033[0m'\n", calculateFCS(deStuffedFrame[4 : 4+dataLength])[0])
-		}
-	}
-
-	newComputedFCS := calculateFCS(deStuffedFrame[4 : 4+dataLength])
-	if newComputedFCS[0] != computedFCS[0] {
-		fmt.Println("Данные были искажены.")
-	} else {
-		fmt.Println("Данные остались прежними.")
-	}
-}
-
 func deByteStuffing(frame []byte) []byte {
 	var result []byte
 	for i := 0; i < len(frame); i++ {
@@ -368,11 +302,6 @@ func deByteStuffing(frame []byte) []byte {
 		}
 	}
 	return result
-}
-
-func printStatus(pairNum int) {
-	mu.Lock()
-	defer mu.Unlock()
 }
 
 func getPortNumber(portName string) byte {
