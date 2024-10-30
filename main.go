@@ -128,26 +128,35 @@ func sendDataToPorts(data string) {
 		frame := createFrame([]byte(data), getPortNumber(outputPortName1))
 		encodedFrame := byteStuffing(frame)
 
+		collisionOccurred := false
 		if rand.Float32() < collisionProbability {
 			fmt.Printf("Возникла коллизия при отправке на порт %d!\n", port.portNum)
+			collisionOccurred = true
 			processCollision(port.transmitter, encodedFrame)
-			return
-		}
-
-		if err := sendData(port.transmitter, encodedFrame); err != nil {
-			log.Printf("Ошибка отправки на порт %d: %v", port.portNum, err)
-		}
-
-		mu.Lock()
-		if port.portNum == 1 {
-			totalBytesSent1 += len(encodedFrame)
 		} else {
-			totalBytesSent2 += len(encodedFrame)
+			if err := sendData(port.transmitter, encodedFrame); err != nil {
+				log.Printf("Ошибка отправки на порт %d: %v", port.portNum, err)
+			}
+
+			mu.Lock()
+			if port.portNum == 1 {
+				totalBytesSent1 += len(encodedFrame)
+			} else {
+				totalBytesSent2 += len(encodedFrame)
+			}
+			mu.Unlock()
 		}
-		mu.Unlock()
+
+		// Вывод состояния передачи
+		if collisionOccurred {
+			fmt.Print("+")
+		} else {
+			fmt.Print("-")
+		}
 
 		processReceivedData(encodedFrame, port.portNum)
 	}
+	fmt.Println() // Для перехода на следующую строку после передачи
 }
 
 func processCollision(port *serial.Port, frame []byte) {
@@ -229,7 +238,6 @@ func calculatedFCS(data []byte) [fcsLengthInBytes]byte {
 			if (fcs[0]>>7)&0x01 != bit {
 				fcs[0] = (fcs[0] << 1) ^ cyclicRedundancyGen
 			} else {
-
 				fcs[0] <<= 1
 			}
 		}
@@ -437,5 +445,3 @@ func getAvailablePortPairs() ([][]string, error) {
 
 	return pairs, nil
 }
-
-// (Остальной код, включая функции calculatedFCS, createFrame, byteStuffing, appendWithStuffing, sendData, receiveData, deByteStuffing, getPortNumber, selectPortsAndBaudRate, openPort, и getAvailablePortPairs аналогичен вашему изначальному коду.)
