@@ -14,16 +14,15 @@ import (
 )
 
 const (
-	flagPrefix             = '$'
-	flagSuffix             = 'a' + 1
-	dataLength             = 2
-	escapeChar             = 0x2A
-	escapeXOR              = 0x20
-	fcsLengthInBits        = 8
-	fcsLengthInBytes       = (fcsLengthInBits + 7) / 8
-	cyclicRedundancyGen    = 0x07
-	channelBusyProbability = 0.5
-	collisionProbability   = 0.6
+	flagPrefix          = '$'
+	flagSuffix          = 'a' + 1
+	dataLength          = 2
+	escapeChar          = 0x2A
+	escapeXOR           = 0x20
+	fcsLengthInBits     = 8
+	fcsLengthInBytes    = (fcsLengthInBits + 7) / 8
+	cyclicRedundancyGen = 0x07
+	numStations         = 3
 )
 
 type Frame struct {
@@ -32,6 +31,19 @@ type Frame struct {
 	DestinationAddress byte
 	Data               [dataLength]byte
 	FCS                [fcsLengthInBytes]byte
+}
+
+type Packet struct {
+	address  int
+	priority int
+	data     string
+}
+
+type Station struct {
+	id       int
+	address  int
+	priority int
+	message  chan Packet
 }
 
 var (
@@ -46,6 +58,8 @@ var (
 	mu              sync.Mutex
 	transmitter1    *serial.Port
 	transmitter2    *serial.Port
+	stations        [numStations]*Station
+	tokenAvailable  = true
 )
 
 func main() {
@@ -77,8 +91,20 @@ func main() {
 	}
 	defer receiver2.Close()
 
+	// Инициализация станций
+	for i := 0; i < numStations; i++ {
+		stations[i] = &Station{
+			id:       i,
+			address:  i,
+			priority: i % 2,
+			message:  make(chan Packet),
+		}
+		go stations[i].run()
+	}
+
 	go receiveData(receiver1, 1)
 	go receiveData(receiver2, 2)
+	go runTokenRing()
 
 	scanner := bufio.NewScanner(os.Stdin)
 	fmt.Println("Введите символы для отправки (нажмите Enter для отправки), 'exit' для выхода:")
@@ -91,7 +117,7 @@ func main() {
 			}
 
 			if data != "" {
-				sendDataWithChannelListening(data)
+				sendDataToPorts(data)
 			} else {
 				fmt.Println("Пожалуйста, введите непустую строку.")
 			}
@@ -103,18 +129,56 @@ func main() {
 	}
 }
 
-func sendDataWithChannelListening(data string) {
+func runTokenRing() {
 	for {
-		if rand.Float32() < channelBusyProbability {
-			fmt.Println("Канал занят, ожидаем освобождения...")
-			time.Sleep(time.Millisecond * time.Duration(rand.Intn(100)))
-			continue
+		mu.Lock()
+		if tokenAvailable {
+			fmt.Println("Token is available")
+			for _, station := range stations {
+				if station.hasMessage() {
+					packet := station.createPacket("Message from station " + fmt.Sprint(station.id))
+					fmt.Printf("Station %d sending packet: %+v\n", station.id, packet)
+					tokenAvailable = false
+					station.message <- packet
+					break
+				}
+			}
+			tokenAvailable = true
 		}
-
-		fmt.Println("Канал свободен, передача данных.")
-		sendDataToPorts(data)
-		break
+		mu.Unlock()
+		time.Sleep(1 * time.Second) // Wait before checking again
 	}
+}
+
+func (s *Station) run() {
+	for {
+		select {
+		case packet := <-s.message:
+			if packet.address == s.address {
+				fmt.Printf("Station %d received packet: %+v\n", s.id, packet)
+			} else {
+				fmt.Printf("Station %d passing packet to next station\n", s.id)
+			}
+		}
+	}
+}
+
+func (s *Station) hasMessage() bool {
+	// Simulate condition to send a message
+	return time.Now().Second()%5 == s.id
+}
+
+func (s *Station) createPacket(data string) Packet {
+	return Packet{
+		address:  (s.id + 1) % numStations,
+		priority: s.priority,
+		data:     wrapData(data),
+	}
+}
+
+func wrapData(data string) string {
+	// Wrap the data with service fields (simplified)
+	return fmt.Sprintf("[HEADER] %s [FOOTER]", data)
 }
 
 func sendDataToPorts(data string) {
@@ -128,45 +192,20 @@ func sendDataToPorts(data string) {
 		frame := createFrame([]byte(data), getPortNumber(outputPortName1))
 		encodedFrame := byteStuffing(frame)
 
-		collisionOccurred := false
-		if rand.Float32() < collisionProbability {
-			fmt.Printf("Возникла коллизия при отправке на порт %d!\n", port.portNum)
-			collisionOccurred = true
-			processCollision(port.transmitter, encodedFrame)
-		} else {
-			if err := sendData(port.transmitter, encodedFrame); err != nil {
-				log.Printf("Ошибка отправки на порт %d: %v", port.portNum, err)
-			}
-
-			mu.Lock()
-			if port.portNum == 1 {
-				totalBytesSent1 += len(encodedFrame)
-			} else {
-				totalBytesSent2 += len(encodedFrame)
-			}
-			mu.Unlock()
+		if err := sendData(port.transmitter, encodedFrame); err != nil {
+			log.Printf("Ошибка отправки на порт %d: %v", port.portNum, err)
 		}
 
-		// Вывод состояния передачи
-		if collisionOccurred {
-			fmt.Print("+")
+		mu.Lock()
+		if port.portNum == 1 {
+			totalBytesSent1 += len(encodedFrame)
 		} else {
-			fmt.Print("-")
+			totalBytesSent2 += len(encodedFrame)
 		}
+		mu.Unlock()
 
 		processReceivedData(encodedFrame, port.portNum)
 	}
-	fmt.Println() // Для перехода на следующую строку после передачи
-}
-
-func processCollision(port *serial.Port, frame []byte) {
-	fmt.Println("Отправляем jam-сигнал...")
-	time.Sleep(time.Millisecond * 10)
-	randomDelay := rand.Intn(10) * 10
-	fmt.Printf("Случайная задержка: %d ms\n", randomDelay)
-	time.Sleep(time.Millisecond * time.Duration(randomDelay))
-	fmt.Println("Повторная попытка отправки.")
-	sendData(port, frame)
 }
 
 func processReceivedData(frame []byte, portNum int) {
@@ -194,22 +233,28 @@ func processReceivedData(frame []byte, portNum int) {
 	}
 	fmt.Printf("' FCS:'%x'\n", computedFCS[0])
 
+	// Случайное искажение
 	if rand.Float32() < 0.7 {
 		dataIndex := rand.Intn(dataLength)
-		originalValue := deStuffedFrame[4+dataIndex]
-		deStuffedFrame[4+dataIndex] ^= 1 << uint(rand.Intn(8))
+		if dataIndex < dataLength {
+			originalValue := deStuffedFrame[4+dataIndex]
+			deStuffedFrame[4+dataIndex] ^= 1 << uint(rand.Intn(8))
 
-		deStuffedFrame[len(deStuffedFrame)-fcsLengthInBytes] = calculatedFCS(deStuffedFrame[4 : 4+dataLength])[0]
-		fmt.Printf("Случайное искажение бита в Data (Порт %d): %d (было: %02x, стало: %02x)\n", portNum, 4+dataIndex, originalValue, deStuffedFrame[4+dataIndex])
+			// Обновляем FCS в кадре
+			deStuffedFrame[len(deStuffedFrame)-fcsLengthInBytes] = calculatedFCS(deStuffedFrame[4 : 4+dataLength])[0]
+
+			fmt.Printf("Случайное искажение бита в Data (Порт %d): %d (было: %02x, стало: %02x)\n", portNum, 4+dataIndex, originalValue, deStuffedFrame[4+dataIndex])
+		}
 	}
 
+	// Проверяем новый FCS
 	newComputedFCS := calculatedFCS(deStuffedFrame[4 : 4+dataLength])
 	if newComputedFCS[0] != computedFCS[0] {
 		fmt.Println("Данные были искажены.")
 		fmt.Printf("Искаженные данные (Порт %d):\n", portNum)
-		printFrameContent(deStuffedFrame)
+		printFrameContent(deStuffedFrame) // Выводим искаженные данные
 		fmt.Printf("Оригинальные данные (Порт %d):\n", portNum)
-		printFrameContent(frame)
+		printFrameContent(frame) // Показываем оригинальные данные
 	} else {
 		fmt.Println("Данные остались прежними.")
 	}
@@ -222,12 +267,12 @@ func printFrameContent(frame []byte) {
 	fmt.Print("Data:'")
 	for i := 4; i < len(frame)-fcsLengthInBytes; i++ {
 		if frame[i] >= 32 && frame[i] <= 126 {
-			fmt.Printf("\033[31m%c\033[0m", frame[i])
+			fmt.Printf("\033[31m%c\033[0m", frame[i]) // Подсветка данных
 		} else {
 			fmt.Printf("%c", frame[i])
 		}
 	}
-	fmt.Printf("' FCS:'\033[31m%x\033[0m'\n", frame[len(frame)-fcsLengthInBytes])
+	fmt.Printf("' FCS:'\033[31m%x\033[0m'\n", frame[len(frame)-fcsLengthInBytes]) // Подсветка FCS
 }
 
 func calculatedFCS(data []byte) [fcsLengthInBytes]byte {
